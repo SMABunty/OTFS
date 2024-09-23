@@ -1,0 +1,180 @@
+% Parameters
+M = 64; 
+N = 30;
+df = 15e3;
+fc = 5e9;
+padLen = 10;
+padType = 'ZP';
+numBits = M * N * 2; % Assuming QPSK (2 bits per symbol)
+
+% Pilot symbol configuration (introducing multiple pilots across the DD grid)
+pilotIndices = [1 5; 32 15; 64 30]; % Pilot positions in (Doppler, Delay) format
+Pdd = zeros(M, N); 
+for i = 1:size(pilotIndices, 1)
+    Pdd(pilotIndices(i,1), pilotIndices(i,2)) = exp(1i * (3 * pi) / 4); % Pilot symbols
+end
+
+% Path configuration (simplified for visualization)
+chanParams.pathDelays = [0, 5, 8]; % Path delays in samples
+chanParams.pathGains = [1, 0.7, 0.5]; % Path gains (linear scale)
+chanParams.pathDopplers = [0, -3, 5]; % Doppler shifts in Hz
+numPaths = length(chanParams.pathDelays); % Number of multipaths
+
+% Sampling frequency at the Nyquist rate
+fsamp = 2 * M * df;
+
+% SNR for visualization
+SNRdB = 20; % SNR value in dB
+
+% Monte Carlo simulation (run once for visualization)
+numSimulations = 1; 
+for sim = 1:numSimulations
+    % Generate Random Data Bits (QPSK)
+    txBits = randi([0 1], numBits, 1); % Random bit sequence
+
+    % Map bits to QPSK symbols
+    txSymbols = 2 * txBits(1:2:end) - 1 + 1i * (2 * txBits(2:2:end) - 1); % QPSK mapping
+    txSymbols = reshape(txSymbols, M, N); % Reshape to MxN matrix
+
+    % Insert pilot symbols in the data grid
+    txSymbols(pilotIndices(:,1), pilotIndices(:,2)) = Pdd(pilotIndices(:,1), pilotIndices(:,2));
+
+    % Modulation (OTFS Modulation)
+    txOut = simpleOTFSmod(txSymbols, padLen, padType);
+
+    % Send the OTFS modulated signal through the Doppler channel
+    dopplerOut = customDopplerChannel(txOut, fsamp, chanParams);
+
+    % Add noise (AWGN)
+    rxSNR = 10^(SNRdB/10);
+    noisePower = (1 / sqrt(rxSNR)) * sqrt(mean(abs(dopplerOut).^2));
+    rxSignal = dopplerOut + noisePower * (randn(size(dopplerOut)) + 1i * randn(size(dopplerOut))) / sqrt(2);
+
+    % Extract valid range of samples
+    numSamps = min(length(rxSignal), M * N); % Ensure numSamps does not exceed length of rxSignal
+    rxIn = rxSignal(1:numSamps); % Extract the valid range of samples
+
+    % ---- Channel Estimation ----
+    Ydd = simpleOTFSdemod(rxIn, M, N, padLen, padType); % Demodulate to get Ydd
+
+    % Extract received pilot symbols at known pilot positions
+    receivedPilots = Ydd(pilotIndices(:,1), pilotIndices(:,2));
+
+    % Estimate channel at pilot locations
+    estimatedChannelPilots = receivedPilots ./ Pdd(pilotIndices(:,1), pilotIndices(:,2));
+
+    % Perform 2D interpolation over the DD grid
+    [dopplerGrid, delayGrid] = meshgrid(1:N, 1:M); % Create grid for interpolation
+    estimatedChannel = griddata(pilotIndices(:,2), pilotIndices(:,1), estimatedChannelPilots, ...
+                                delayGrid, dopplerGrid, 'linear'); % 2D interpolation
+
+    % Ensure no NaN values in estimatedChannel
+    estimatedChannel(isnan(estimatedChannel)) = 0;
+
+    % ---- Visualization in Command Window ----
+    fprintf('Estimated Channel at Pilot Locations:\n');
+    disp(estimatedChannelPilots); % Display estimated channel at pilot positions
+
+    fprintf('Interpolated Channel (Full Grid):\n');
+    disp(estimatedChannel); % Display the entire interpolated channel grid
+
+    % ---- Visualization in Plots ----
+    
+    % Plot true channel (synthetic or reference channel) if available
+    figure;
+    subplot(1, 3, 1);
+    surf(real(estimatedChannel)); % Real part of the interpolated channel
+    title('Real Part of Interpolated Channel');
+    xlabel('Doppler Index');
+    ylabel('Delay Index');
+    zlabel('Real Part');
+    colorbar;
+
+    % Plot the magnitude of the estimated channel
+    subplot(1, 3, 2);
+    surf(abs(estimatedChannel)); % Magnitude of the interpolated channel
+    title('Magnitude of Interpolated Channel');
+    xlabel('Doppler Index');
+    ylabel('Delay Index');
+    zlabel('Magnitude');
+    colorbar;
+
+    % Plot channel estimation error (if true channel is available)
+    subplot(1, 3, 3);
+    surf(angle(estimatedChannel)); % Phase of the interpolated channel
+    title('Phase of Interpolated Channel');
+    xlabel('Doppler Index');
+    ylabel('Delay Index');
+    zlabel('Phase (radians)');
+    colorbar;
+end
+
+% Functions
+% ---------------- OTFS Modulation Function ----------------
+function txOut = simpleOTFSmod(Pdd, padLen, padType)
+    % Define basic modulation parameters
+    [M, N] = size(Pdd); % Get dimensions of the input grid
+    
+    % Perform SFFT to move to the time-frequency domain
+    X_tf = ifft(ifft(Pdd, [], 1), [], 2); % Apply 2D IFFT
+    
+    % Reshape the data into a single vector for transmission
+    txSignal = reshape(X_tf, [], 1);
+    
+    % Padding: Zero padding (ZP) or Cyclic prefix (CP)
+    if strcmp(padType, 'ZP')
+        txSignal = [txSignal; zeros(padLen, 1)];
+    elseif strcmp(padType, 'CP')
+        txSignal = [txSignal(end - padLen + 1:end); txSignal];
+    end
+    
+    txOut = txSignal; % Output the modulated signal
+end
+
+% ---------------- OTFS Demodulation Function ----------------
+function Ydd = simpleOTFSdemod(rxSignal, M, N, padLen, padType)
+    % Adjust the received signal length for padding
+    if strcmp(padType, 'ZP') || strcmp(padType, 'CP')
+        rxSignal = rxSignal(1:end-padLen); % Remove padding if needed
+    end
+    
+    % Reshape the received signal into an MxN matrix
+    if length(rxSignal) < M * N
+        rxSignal = [rxSignal; zeros(M * N - length(rxSignal), 1)]; % Zero pad if necessary
+    elseif length(rxSignal) > M * N
+        rxSignal = rxSignal(1:M * N); % Truncate if too long
+    end
+
+    rxSignal = reshape(rxSignal, M, []); % Automatically infer N with []
+    
+    % Perform SFFT (2D FFT) to move from the time-frequency domain to DD domain
+    Ydd = fft(fft(rxSignal, [], 2), [], 1); % 2D FFT
+end
+
+% ---------------- Custom Doppler Channel ----------------
+function rxOut = customDopplerChannel(txIn, fs, chanParams)
+    % Parameters
+    numPaths = length(chanParams.pathDelays);
+    [M, N] = size(txIn); % Input signal dimensions
+    numSamps = length(txIn); % Total number of samples
+    
+    % Initialize received signal
+    rxOut = zeros(size(txIn));
+    
+    % Doppler and delay effects
+    for path = 1:numPaths
+        dopplerShift = chanParams.pathDopplers(path);
+        delaySamples = chanParams.pathDelays(path);
+        pathGain = chanParams.pathGains(path);
+        
+        % Doppler shift effect
+        t = (0:numSamps-1)' / fs; % Time vector for the transmitted signal
+        dopplerEffect = exp(1i * 2 * pi * dopplerShift * t); % Doppler shift in time domain
+        
+        % Delayed and attenuated signal
+        delayedSignal = [zeros(delaySamples, 1); txIn(1:end - delaySamples)] * pathGain;
+        
+        % Apply Doppler shift to the delayed signal
+        rxOut = rxOut + delayedSignal .* dopplerEffect;
+    end
+end
